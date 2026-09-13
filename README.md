@@ -3,7 +3,6 @@
 1. horses
 2. beavers
 3. sheep
-4. cows
-5. cat
-6. dog
-7. chicken
+4. cat
+5. dog
+6. chicken
