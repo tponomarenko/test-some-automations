@@ -6,3 +6,4 @@
 4. cows
 5. cat
 6. dog
+7. chicken
