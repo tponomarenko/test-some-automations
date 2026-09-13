@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Update linked project item status
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           # Names, not IDs — the script resolves the real IDs itself.
           STATUS_FIELD_NAME: "Status"
