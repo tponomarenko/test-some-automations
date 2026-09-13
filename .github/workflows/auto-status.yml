@@ -1,6 +1,6 @@
 # Automatically moves a linked Issue's Project (v2) status from
 # "In progress" to "In verification" once every Pull Request
-# that closes it has been merged.
+# that references it has been merged.
 name: Move issue to "In verification" when all linked PRs merged
 
 on:
@@ -33,6 +33,8 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
             const prNumber = context.payload.pull_request.number;
+            const prBody = context.payload.pull_request.body || "";
+            const prTitle = context.payload.pull_request.title || "";
             const STATUS_FIELD_NAME = process.env.STATUS_FIELD_NAME;
             const FROM_STATUS_NAME = process.env.FROM_STATUS_NAME;
             const TO_STATUS_NAME = process.env.TO_STATUS_NAME;
@@ -176,49 +178,61 @@ jobs:
               }
             }
 
-            // Step 1: find which issues this merged PR closes, and for
-            // each of them collect all linked PRs plus their current
-            // status in every project they belong to.
-            const prQuery = await github.graphql(
-              `
-              query($owner:String!, $repo:String!, $number:Int!) {
-                repository(owner:$owner, name:$repo) {
-                  pullRequest(number:$number) {
-                    closingIssuesReferences(first: 10) {
-                      nodes {
-                        id
-                        number
-                        projectItems(first: 10) {
-                          nodes {
-                            id
-                            project { id title }
-                            fieldValueByName(name: "Status") {
-                              ... on ProjectV2ItemFieldSingleSelectValue { name }
-                            }
+            // Step 1: extract plain issue references like "#4", "Refs #4",
+            // "Closes #4", etc. from the PR title and body. Unlike
+            // closingIssuesReferences, this also catches non-closing
+            // references such as "Refs #4".
+            const issueNumbers = [...new Set(
+              [...(prTitle + "\n" + prBody).matchAll(/#(\d+)/g)].map((m) => parseInt(m[1], 10))
+            )];
+
+            if (issueNumbers.length === 0) {
+              core.info("No issue references found in PR title/body — nothing to do");
+              return;
+            }
+
+            core.info(`Found issue references in PR #${prNumber}: ${issueNumbers.join(", ")}`);
+
+            for (const issueNumber of issueNumbers) {
+              const issueQuery = await github.graphql(
+                `
+                query($owner:String!, $repo:String!, $number:Int!) {
+                  repository(owner:$owner, name:$repo) {
+                    issue(number:$number) {
+                      id
+                      number
+                      projectItems(first: 10) {
+                        nodes {
+                          id
+                          project { id title }
+                          fieldValueByName(name: "Status") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { name }
                           }
                         }
-                        timelineItems(first: 100, itemTypes: [CONNECTED_EVENT, CROSS_REFERENCED_EVENT]) {
-                          nodes {
-                            ... on ConnectedEvent {
-                              subject { ... on PullRequest { number state } }
-                            }
-                            ... on CrossReferencedEvent {
-                              source { ... on PullRequest { number state } }
-                            }
+                      }
+                      timelineItems(first: 100, itemTypes: [CONNECTED_EVENT, CROSS_REFERENCED_EVENT]) {
+                        nodes {
+                          ... on ConnectedEvent {
+                            subject { ... on PullRequest { number state } }
+                          }
+                          ... on CrossReferencedEvent {
+                            source { ... on PullRequest { number state } }
                           }
                         }
                       }
                     }
                   }
                 }
+              `,
+                { owner, repo, number: issueNumber }
+              );
+
+              const issue = issueQuery.repository.issue;
+              if (!issue) {
+                core.info(`#${issueNumber} is not an issue in this repo — skipping`);
+                continue;
               }
-            `,
-              { owner, repo, number: prNumber }
-            );
 
-            const issues = prQuery.repository.pullRequest.closingIssuesReferences.nodes;
-
-            for (const issue of issues) {
               // Step 2: check that every PR linked to this issue is merged.
               const linkedPRs = issue.timelineItems.nodes
                 .map((n) => n.subject || n.source)
@@ -253,3 +267,4 @@ jobs:
             }
 
             if (cacheChanged) await saveCache();
+            
