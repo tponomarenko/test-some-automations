@@ -1,88 +1,35 @@
-# Automatically moves a linked Issue's Project (v2) status from
-# "In progress" to "In verification" once every Pull Request
-# that references it has been merged.
 name: Move issue to "In verification" when all linked PRs merged
 
 on:
   pull_request:
     types: [closed]
 
-# Restricts only the built-in GITHUB_TOKEN.
-# The actual GraphQL calls use PROJECT_PAT (see below), since
-# GITHUB_TOKEN cannot access the Projects v2 API.
 permissions:
   contents: read
 
 jobs:
   update-status:
-    # Only run when the PR was actually merged (not just closed).
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - name: Update linked project item status
         uses: actions/github-script@v9
         env:
-          # Names, not IDs — the script resolves the real IDs itself.
           STATUS_FIELD_NAME: "Status"
           FROM_STATUS_NAME: "In progress"
           TO_STATUS_NAME: "In verification"
         with:
-          # Personal Access Token with "project" scope (see conversation
-          # history for how it was created and stored as a repo secret).
           github-token: ${{ secrets.PROJECT_PAT }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = context.payload.pull_request.number;
             const prBody = context.payload.pull_request.body || "";
-            const prTitle = context.payload.pull_request.title || "";
+            const prTitle = context.payload.pull_request.title;
             const STATUS_FIELD_NAME = process.env.STATUS_FIELD_NAME;
             const FROM_STATUS_NAME = process.env.FROM_STATUS_NAME;
             const TO_STATUS_NAME = process.env.TO_STATUS_NAME;
 
-            // Name of the repository variable used to cache resolved
-            // field/option IDs per project, so we don't re-fetch the
-            // project's field schema on every single run.
-            const CACHE_VAR_NAME = "PROJECT_STATUS_FIELD_CACHE";
-
-            let cache = {};
-            try {
-              const { data } = await github.rest.actions.getRepoVariable({
-                owner,
-                repo,
-                name: CACHE_VAR_NAME,
-              });
-              cache = JSON.parse(data.value || "{}");
-            } catch (e) {
-              core.info("No cache variable yet — starting with an empty cache");
-            }
-            let cacheChanged = false;
-
-            // Persists the in-memory cache back to the repo variable.
-            async function saveCache() {
-              const value = JSON.stringify(cache);
-              try {
-                await github.rest.actions.updateRepoVariable({
-                  owner,
-                  repo,
-                  name: CACHE_VAR_NAME,
-                  value,
-                });
-              } catch (e) {
-                // Variable doesn't exist yet — create it.
-                await github.rest.actions.createRepoVariable({
-                  owner,
-                  repo,
-                  name: CACHE_VAR_NAME,
-                  value,
-                });
-              }
-            }
-
-            // Always fetches the CURRENT field/option IDs from GitHub
-            // by name. Used both on first run and whenever the cache
-            // turns out to be stale (e.g. someone renamed the field
-            // or an option).
-            async function fetchFieldsFromGitHub(projectId) {
+            async function trySetStatus(projectId, itemId, projectTitle) {
               const res = await github.graphql(
                 `
                 query($projectId: ID!) {
@@ -105,34 +52,21 @@ jobs:
               );
 
               const field = res.node.fields.nodes.find(
-                (f) => f && f.name?.toLowerCase() === STATUS_FIELD_NAME.toLowerCase()
+                (f) => f && f.name.toLowerCase() === STATUS_FIELD_NAME.toLowerCase()
               );
-              if (!field) return null;
+              if (!field) {
+                core.info(`Project "${projectTitle}": No "${STATUS_FIELD_NAME}" field — skipping`);
+                return false;
+              }
 
               const toOpt = field.options.find(
                 (o) => o.name.toLowerCase() === TO_STATUS_NAME.toLowerCase()
               );
-              if (!toOpt) return null;
-
-              return { fieldId: field.id, toOptionId: toOpt.id };
-            }
-
-            // Returns field/option IDs for a project, preferring the
-            // cache unless forceRefresh is requested.
-            async function getFields(projectId, forceRefresh = false) {
-              if (!forceRefresh && cache[projectId]) {
-                return cache[projectId];
+              if (!toOpt) {
+                core.info(`Project "${projectTitle}": No "${TO_STATUS_NAME}" option on field "${field.name}" — skipping`);
+                return false;
               }
-              const fresh = await fetchFieldsFromGitHub(projectId);
-              if (fresh) {
-                cache[projectId] = fresh;
-                cacheChanged = true;
-              }
-              return fresh;
-            }
 
-            // Runs the actual mutation that sets the Status field.
-            async function applyMutation(projectId, itemId, fields) {
               await github.graphql(
                 `
                 mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
@@ -146,42 +80,11 @@ jobs:
                   }
                 }
               `,
-                {
-                  projectId,
-                  itemId,
-                  fieldId: fields.fieldId,
-                  optionId: fields.toOptionId,
-                }
+                { projectId, itemId, fieldId: field.id, optionId: toOpt.id }
               );
+              return true;
             }
 
-            // Tries the cached IDs first. If the mutation fails
-            // (e.g. because the field/option was renamed and the
-            // cached ID is stale), it re-fetches fresh IDs and
-            // retries once automatically — no manual cache cleanup
-            // is ever needed.
-            async function setStatus(projectId, itemId) {
-              let fields = await getFields(projectId);
-              if (!fields) return false;
-
-              try {
-                await applyMutation(projectId, itemId, fields);
-                return true;
-              } catch (err) {
-                core.warning(
-                  `Cache for project ${projectId} looks stale (${err.message}) — refreshing and retrying`
-                );
-                fields = await getFields(projectId, /* forceRefresh */ true);
-                if (!fields) return false;
-                await applyMutation(projectId, itemId, fields);
-                return true;
-              }
-            }
-
-            // Step 1: extract plain issue references like "#4", "Refs #4",
-            // "Closes #4", etc. from the PR title and body. Unlike
-            // closingIssuesReferences, this also catches non-closing
-            // references such as "Refs #4".
             const issueNumbers = [...new Set(
               [...(prTitle + "\n" + prBody).matchAll(/#(\d+)/g)].map((m) => parseInt(m[1], 10))
             )];
@@ -233,7 +136,6 @@ jobs:
                 continue;
               }
 
-              // Step 2: check that every PR linked to this issue is merged.
               const linkedPRs = issue.timelineItems.nodes
                 .map((n) => n.subject || n.source)
                 .filter(Boolean);
@@ -246,8 +148,6 @@ jobs:
                 continue;
               }
 
-              // Step 3: for every project this issue belongs to, only
-              // update it if it's currently in the "from" status.
               for (const item of issue.projectItems.nodes) {
                 const currentStatus = item.fieldValueByName?.name;
                 if (currentStatus && currentStatus.toLowerCase() !== FROM_STATUS_NAME.toLowerCase()) {
@@ -257,14 +157,10 @@ jobs:
                   continue;
                 }
 
-                const ok = await setStatus(item.project.id, item.id);
-                core.info(
-                  ok
-                    ? `Issue #${issue.number} in "${item.project.title}" → "${TO_STATUS_NAME}"`
-                    : `Project "${item.project.title}": no "${STATUS_FIELD_NAME}" field or "${TO_STATUS_NAME}" option found`
-                );
+                const updated = await trySetStatus(item.project.id, item.id, item.project.title);
+                if (updated) {
+                  core.info(`Issue #${issue.number} in "${item.project.title}" → "${TO_STATUS_NAME}"`);
+                }
               }
             }
-
-            if (cacheChanged) await saveCache();
             
