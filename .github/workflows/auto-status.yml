@@ -52,7 +52,7 @@ jobs:
               );
 
               const field = res.node.fields.nodes.find(
-                (f) => f && f.name.toLowerCase() === STATUS_FIELD_NAME.toLowerCase()
+                (f) => f.name && f.name.toLowerCase() === STATUS_FIELD_NAME.toLowerCase()
               );
               if (!field) {
                 core.info(`Project "${projectTitle}": No "${STATUS_FIELD_NAME}" field — skipping`);
