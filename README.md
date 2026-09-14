@@ -5,3 +5,4 @@
 3. sheep
 4. cats
 5. dog
+6. rabbit
